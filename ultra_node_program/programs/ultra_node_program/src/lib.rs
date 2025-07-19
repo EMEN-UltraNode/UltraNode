@@ -1,115 +1,100 @@
-#![allow(deprecated)]
-
-
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, TokenAccount, Token};
+use anchor_lang::solana_program::{program::invoke_signed, system_instruction};
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
-declare_id!("CTq9UQdmsbWZoKh1hsioRyC4wiqCrx76UPH9wiKUwcFh");
+declare_id!("8XiTe11YjconcJWDPE7SEUCNmfWFpWZmNRXDKoHQcjeC");
 
 #[program]
 pub mod ultra_node_program {
     use super::*;
 
-    pub fn submit_proof(
-        ctx: Context<SubmitProof>,
-        tx_hash: [u8; 32],
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn submit_verified_proof(
+        ctx: Context<SubmitVerifiedProof>,
+        proof_hash: [u8; 32],
         merkle_root: [u8; 32],
+        validator_signature: [u8; 64],
     ) -> Result<()> {
-        let node = &mut ctx.accounts.node;
-        node.wallet = ctx.accounts.user.key();
-        node.tx_count += 1;
-        node.last_tx = tx_hash;
-        node.merkle_root = merkle_root;
-        node.bump = ctx.bumps.node;
-        Ok(())
-    }
+        // Save proof commitment (for audit trail)
+        let proof_account = &mut ctx.accounts.proof_account;
+        proof_account.validator = ctx.accounts.validator.key();
+        proof_account.submitter = ctx.accounts.submitter.key();
+        proof_account.proof_hash = proof_hash;
+        proof_account.merkle_root = merkle_root;
 
-    pub fn record_uptime(ctx: Context<RecordUptime>) -> Result<()> {
-        let node = &mut ctx.accounts.node;
-        node.uptime += 1;
-        Ok(())
-    }
+        // Transfer BONK reward from vault to submitter
+        let seeds = &[b"vault".as_ref(), &[ctx.accounts.vault.bump]];
+        let signer = &[&seeds[..]];
 
-    pub fn claim_rewards(ctx: Context<ClaimRewards>) -> Result<()> {
-        let node = &mut ctx.accounts.node;
-        let total = node.tx_count as u64 + (node.uptime as u64 / 48) * 5;
-
-        let signer_seeds: &[&[u8]] = &[b"auth", &[node.bump]];
-        let signer: &[&[&[u8]]] = &[signer_seeds];
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.vault_token_account.to_account_info(),
+            to: ctx.accounts.submitter_token_account.to_account_info(),
+            authority: ctx.accounts.vault.to_account_info(),
+        };
 
         let cpi_ctx = CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
-            token::MintTo {
-                mint: ctx.accounts.mint.to_account_info(),
-                to: ctx.accounts.to.to_account_info(),
-                authority: ctx.accounts.auth.to_account_info(),
-            },
+            cpi_accounts,
             signer,
         );
 
-        token::mint_to(cpi_ctx, total)?;
+        token::transfer(cpi_ctx, 1_000_000)?; // reward: 0.001 BONK (assuming 6 decimals)
 
-        node.tx_count = 0;
-        node.uptime = 0;
         Ok(())
     }
 }
 
 #[derive(Accounts)]
-pub struct SubmitProof<'info> {
-    #[account(
-        init_if_needed,
-        payer = user,
-        seeds = [b"node", user.key().as_ref()],
-        bump,
-        space = 8 + Node::LEN,
-    )]
-    pub node: Account<'info, Node>,
-    #[account(mut)]
-    pub user: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
+pub struct Initialize {}
 
 #[derive(Accounts)]
-pub struct RecordUptime<'info> {
-    #[account(
-        mut,
-        seeds = [b"node", user.key().as_ref()],
-        bump = node.bump
-    )]
-    pub node: Account<'info, Node>,
-    pub user: Signer<'info>,
-}
+#[instruction(proof_hash: [u8; 32])]
+pub struct SubmitVerifiedProof<'info> {
+    #[account(init, payer = submitter, space = 8 + ProofAccount::SIZE, seeds = [b"proof", &proof_hash], bump)]
+    pub proof_account: Account<'info, ProofAccount>,
 
-#[derive(Accounts)]
-pub struct ClaimRewards<'info> {
-    #[account(
-        mut,
-        seeds = [b"node", user.key().as_ref()],
-        bump = node.bump
-    )]
-    pub node: Account<'info, Node>,
     #[account(mut)]
-    pub mint: Account<'info, Mint>,
-    #[account(mut)]
-    pub to: Account<'info, TokenAccount>,
-    /// CHECK: PDA derived from [b"auth"]
-    #[account(seeds = [b"auth"], bump)]
-    pub auth: UncheckedAccount<'info>,
+    pub submitter: Signer<'info>,
+
+    /// CHECK: Validator pubkey (used for indexing, not signing)
+    pub validator: UncheckedAccount<'info>,
+
+    #[account(mut, seeds = [b"vault"], bump = vault.bump)]
+    pub vault: Account<'info, Vault>,
+
+    #[account(mut, associated_token::mint = bonk_mint, associated_token::authority = vault)]
+    pub vault_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut, associated_token::mint = bonk_mint, associated_token::authority = submitter)]
+    pub submitter_token_account: Account<'info, TokenAccount>,
+
+    pub bonk_mint: Account<'info, Mint>,
+
     pub token_program: Program<'info, Token>,
-    pub user: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+
+    pub rent: Sysvar<'info, Rent>,
+
+    pub associated_token_program: Program<'info, anchor_spl::associated_token::AssociatedToken>,
 }
 
 #[account]
-pub struct Node {
-    pub wallet: Pubkey,
-    pub tx_count: u32,
-    pub uptime: u32,
-    pub last_tx: [u8; 32],
+pub struct ProofAccount {
+    pub validator: Pubkey,
+    pub submitter: Pubkey,
+    pub proof_hash: [u8; 32],
     pub merkle_root: [u8; 32],
-    pub bump: u8,
 }
 
-impl Node {
-    pub const LEN: usize = 32 + 4 + 4 + 32 + 32 + 1;
+impl ProofAccount {
+    pub const SIZE: usize = 32 + 32 + 32 + 32;
+}
+
+#[account]
+pub struct Vault {
+    pub bump: u8,
 }

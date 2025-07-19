@@ -1,4 +1,6 @@
 use sha2::{Digest, Sha256};
+use wasm_bindgen::prelude::*;
+
 
 /// Build the Merkle root from hashed leaves.
 pub fn build_merkle_root(leaves: &[Vec<u8>]) -> Vec<u8> {
@@ -155,4 +157,33 @@ mod tests {
             "Single-leaf Merkle tree proof failed"
         );
     }
+}
+
+
+
+#[wasm_bindgen]
+pub fn verify_merkle_proof_flat(
+    leaf: &[u8],
+    index: u32,
+    root: &[u8],
+    proof: &[u8], // flattened 32*N byte vector
+) -> bool {
+    if leaf.len() != 32 || root.len() != 32 || proof.len() % 32 != 0 {
+        return false;
+    }
+
+    let mut hash = sha2::Sha256::digest(leaf).to_vec();
+    let mut idx = index;
+
+    for sibling in proof.chunks(32) {
+        let combined = if idx % 2 == 0 {
+            [hash.as_slice(), sibling].concat()
+        } else {
+            [sibling, hash.as_slice()].concat()
+        };
+        hash = sha2::Sha256::digest(&combined).to_vec();
+        idx /= 2;
+    }
+
+    hash == root
 }
